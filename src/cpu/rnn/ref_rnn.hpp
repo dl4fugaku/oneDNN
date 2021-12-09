@@ -59,10 +59,45 @@ void gates_reduction(const rnn_utils::rnn_conf_t &rnn, const gates_t *ws_gates_,
     // parallel_nd path
 #if DNNL_CPU_RUNTIME == DNNL_RUNTIME_OMP && _OPENMP >= 201307 \
         && __INTEL_COMPILER < 1910
+#if 0
 #pragma omp parallel for simd collapse(2)
     for (int i = 0; i < rnn.n_gates; i++)
         for (int k = 0; k < rnn.dhc; k++)
             body_loop(i, k, ws_gates_, diff_bias_, rnn);
+#else
+    #pragma omp parallel
+    {
+        acc_t *t_diff_bias_ = (acc_t *)calloc(rnn.dhc * rnn.n_gates,
+                                              sizeof(acc_t));
+        if (rnn.is_f32())
+        {
+            #pragma omp for schedule(static) nowait
+            for (int j = 0; j < rnn.mb; j++)
+                cblas_saxpy(rnn.n_gates * rnn.dhc, 1.0,
+                            (float*)&ws_gates_[j * rnn.scratch_gates_ld], 1,
+                            (float*)t_diff_bias_, 1);
+            #pragma omp critical
+            cblas_saxpy(rnn.n_gates * rnn.dhc, 1.0,
+                        (float*)t_diff_bias_, 1, (float*)diff_bias_, 1);
+        } else {
+            #pragma omp for nowait
+            for (int j = 0; j < rnn.mb; j++)
+                for (int i = 0; i < rnn.n_gates; i++)
+                    for (int k = 0; k < rnn.dhc; k++)
+                        t_diff_bias_[i * rnn.dhc + k]
+                            += ws_gates_[j * rnn.scratch_gates_ld
+                                         + i * rnn.dhc + k];
+            #pragma omp critical
+            {
+                for (int i = 0; i < rnn.n_gates; i++)
+                    for (int k = 0; k < rnn.dhc; k++)
+                        diff_bias_[i * rnn.dhc + k]
+                            += t_diff_bias_[i * rnn.dhc + k];
+            }
+        }
+        free(t_diff_bias_);
+    }
+#endif
 #else
     parallel_nd(rnn.n_gates, rnn.dhc, [&](dim_t i, dim_t k) {
         body_loop(i, k, ws_gates_, diff_bias_, rnn);
