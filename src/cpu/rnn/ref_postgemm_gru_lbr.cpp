@@ -86,7 +86,7 @@ void gru_lbr_fwd_postgemm_template(T1 func1, T2 func2, T3 to_src,
         }
     });
 #else
-    if (dst_layer_ != nullptr && rnn.is_training) {
+    if (dst_layer_ != nullptr && rnn.is_training && rnn.bias_dt == data_type::f32) {
         // Optimized kernel with no branching behavior
         // Note: dst_iter_ is uncooperative.
         // Note: The driver function sets dst_iter_=nullptr since it
@@ -98,33 +98,44 @@ void gru_lbr_fwd_postgemm_template(T1 func1, T2 func2, T3 to_src,
                 if (j_end > rnn.dhc) j_end = rnn.dhc;
                 float Wh_b_block[block_size];
                 src_data_t G0_block[block_size], G1_block[block_size], G2_block[block_size];
+
+                //we have no data_type::bf16 on fugaku, so skip to_float
+                auto bias0 = static_cast<const float *>(bias_aoc(0, j_begin));
+                auto bias1 = static_cast<const float *>(bias_aoc(1, j_begin));
+                auto bias2 = static_cast<const float *>(bias_aoc(2, j_begin));
+                auto bias3 = static_cast<const float *>(bias_aoc(3, j_begin));
+
+                auto cell0 = &scratch_cell(i, 0, j_begin);
+                auto cell1 = &scratch_cell(i, 1, j_begin);
+                auto cell2 = &scratch_cell(i, 2, j_begin);
+
+                auto gates0 = &scratch_gates(i, 0, j_begin);
+                auto gates1 = &scratch_gates(i, 1, j_begin);
+                auto gates2 = &scratch_gates(i, 2, j_begin);
+
                 PRAGMA_OMP_SIMD()
-                for (int j = j_begin; j < j_end; ++j) {
-                    const auto j_block = j - j_begin;
-                    auto& Wh_b = Wh_b_block[j_block];
-                    auto& G0 = G0_block[j_block];
-                    auto& G1 = G1_block[j_block];
-                    auto& G2 = G2_block[j_block];
-                    Wh_b = scratch_cell(i, 2, j) + bias(3, j);
-                    G0 = scratch_gates(i, 0, j) + scratch_cell(i, 0, j) + bias(0, j);
-                    G1 = scratch_gates(i, 1, j) + scratch_cell(i, 1, j) + bias(1, j);
-                    G2 = scratch_gates(i, 2, j) + G1 * Wh_b + bias(2, j);
-                }
+                for (int j = 0; j < j_end - j_begin; ++j)
+                    Wh_b_block[j] = cell2[j] + bias3[j];
                 PRAGMA_OMP_SIMD()
-                for (int j_block = 0; j_block < block_size; ++j_block) {
-                    auto& G0 = G0_block[j_block];
-                    G0 = func1(scales, G0);
-                }
+                for (int j = 0; j < j_end - j_begin; ++j)
+                    G0_block[j] = gates0[j] + cell0[j] + bias0[j];
                 PRAGMA_OMP_SIMD()
-                for (int j_block = 0; j_block < block_size; ++j_block) {
-                    auto& G1 = G1_block[j_block];
-                    G1 = func1(scales+1, G1);
-                }
+                for (int j = 0; j < j_end - j_begin; ++j)
+                    G1_block[j] = gates1[j] + cell1[j] + bias1[j];
                 PRAGMA_OMP_SIMD()
-                for (int j_block = 0; j_block < block_size; ++j_block) {
-                    auto& G2 = G2_block[j_block];
-                    G2 = func2(scales+2, G2);
-                }
+                for (int j = 0; j < j_end - j_begin; ++j)
+                    G2_block[j] = gates2[j] + G1_block[j] * (cell2[j] + bias3[j]) + bias2[j];
+
+                PRAGMA_OMP_SIMD()
+                for (int j = 0; j < block_size; ++j)
+                    G0_block[j] = func1(scales, G0_block[j]);
+                PRAGMA_OMP_SIMD()
+                for (int j = 0; j < block_size; ++j)
+                    G1_block[j] = func1(scales+1, G1_block[j]);
+                PRAGMA_OMP_SIMD()
+                for (int j = 0; j < block_size; ++j)
+                    G2_block[j] = func2(scales+2, G2_block[j]);
+
                 PRAGMA_OMP_SIMD()
                 for (int j = j_begin; j < j_end; ++j) {
                     const auto j_block = j - j_begin;
